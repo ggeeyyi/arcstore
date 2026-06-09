@@ -1,0 +1,35 @@
+[project]
+name = "arcstore"
+version = "0.1.0"
+description = "Unified storage IO for ML training: direct S3, local scratch, and FUSE-mounted S3 behind one path-driven API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.28",
+]
+
+[project.optional-dependencies]
+torch = [
+    "torch>=2.4",
+    "safetensors>=0.4",
+    "s3torchconnector>=1.2",
+    "runai-model-streamer>=0.11",
+    "runai-model-streamer-s3>=0.11",
+]
+test = [
+    "pytest>=8",
+    "moto[s3]>=5",
+]
+
+[project.scripts]
+arcstore-tee = "arcstore.logtee:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arcstore"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
