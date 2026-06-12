@@ -26,6 +26,7 @@ def find_latest_ckpt(
     *,
     pattern: str = DEFAULT_CKPT_PATTERN,
     required_file: str | None = "model.pt",
+    read_policy: str | None = "direct_s3",
 ) -> tuple[str, int] | None:
     """Return ``(path_or_uri, step)`` of the newest complete checkpoint, or None.
 
@@ -42,7 +43,7 @@ def find_latest_ckpt(
     ckpt_re = re.compile(pattern.rstrip("$") + r"/?$")
 
     try:
-        children = list_prefix(ckpts_uri)
+        children = list_prefix(ckpts_uri, read_policy=read_policy)
     except RuntimeError as e:
         logger.warning(f"[arcstore] cannot list {ckpts_uri}: {e}")
         return None
@@ -65,7 +66,7 @@ def find_latest_ckpt(
         if required_file is None:
             return ckpt_dir, step
         try:
-            inside = list_prefix(ckpt_dir)
+            inside = list_prefix(ckpt_dir, read_policy=read_policy)
         except RuntimeError:
             continue
         if required_file in inside:

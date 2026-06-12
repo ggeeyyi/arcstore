@@ -46,3 +46,34 @@ def test_atexit_flush_logs_not_raises(fake_s5cmd, tmp_path, no_cli, caplog):
     arcstore.upload_file_async(str(tmp_path / "missing.bin"), "s3://bkt/x/m.bin")
     _atexit_flush()  # must swallow + log, not raise
     assert any("atexit" in r.message for r in caplog.records)
+
+
+def test_download_dir_requires_marker(fake_s5cmd, tmp_path):
+    src = fake_s5cmd / "bkt" / "dcp"
+    src.mkdir(parents=True)
+    (src / "shard.bin").write_bytes(b"x")
+
+    with pytest.raises(FileNotFoundError):
+        arcstore.download_dir(
+            "s3://bkt/dcp",
+            str(tmp_path / "out"),
+            required_files=(".metadata",),
+            retries=1,
+        )
+
+
+def test_download_dir_marker_passes(fake_s5cmd, tmp_path):
+    src = fake_s5cmd / "bkt" / "dcp"
+    src.mkdir(parents=True)
+    (src / ".metadata").write_bytes(b"meta")
+    (src / "shard.bin").write_bytes(b"x")
+
+    out = tmp_path / "out"
+    arcstore.download_dir(
+        "s3://bkt/dcp",
+        str(out),
+        required_files=(".metadata",),
+        retries=1,
+    )
+
+    assert (out / ".metadata").read_bytes() == b"meta"

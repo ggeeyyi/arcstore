@@ -20,7 +20,8 @@ import os
 from typing import IO
 
 from . import s3cli
-from .location import resolve, split_s3
+from ._env import read_policy as _read_policy
+from .location import resolve
 from .uploads import (  # noqa: F401  (re-exported write primitives)
     download_dir,
     track_future,
@@ -54,11 +55,7 @@ def read_bytes(path: str) -> bytes:
         with open(rp, "rb") as f:
             return f.read()
     if loc.is_s3:
-        import boto3
-
-        bucket, key = split_s3(loc.s3_uri())
-        body = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"]
-        return body.read()
+        return s3cli.read_object_bytes(loc.s3_uri())
     raise FileNotFoundError(path)
 
 
@@ -78,14 +75,22 @@ def open_read(path: str, mode: str = "rb") -> IO:
     raise FileNotFoundError(path)
 
 
-def list_prefix(path: str) -> list[str]:
+def _use_read_path(loc, policy: str | None) -> bool:
+    """Whether a read helper should consult ``Location.read_path()``."""
+    rp = _read_policy(policy)
+    if loc.is_s3 and rp == "direct_s3":
+        return False
+    return True
+
+
+def list_prefix(path: str, *, read_policy: str | None = None) -> list[str]:
     """Immediate children of a directory/prefix; subdirectories carry ``/``.
 
     Local and mounted sources use ``os.scandir``; direct S3 uses
     s5cmd/aws/boto3 listing. Missing dir/prefix returns ``[]``.
     """
     loc = resolve(path)
-    rp = loc.read_path()
+    rp = loc.read_path() if _use_read_path(loc, read_policy) else None
     if rp is not None and os.path.isdir(rp):
         out: list[str] = []
         with os.scandir(rp) as it:
@@ -97,7 +102,12 @@ def list_prefix(path: str) -> list[str]:
     return []
 
 
-def glob_files(path_or_prefix: str, suffix: str) -> list[str]:
+def glob_files(
+    path_or_prefix: str,
+    suffix: str,
+    *,
+    read_policy: str | None = None,
+) -> list[str]:
     """Files under a dir/prefix ending in ``suffix``, sorted.
 
     Returns local paths when a filesystem read path is available (local dir
@@ -105,7 +115,7 @@ def glob_files(path_or_prefix: str, suffix: str) -> list[str]:
     ``Location.readable()``.
     """
     loc = resolve(path_or_prefix)
-    rp = loc.read_path()
+    rp = loc.read_path() if _use_read_path(loc, read_policy) else None
     if rp is not None and os.path.isdir(rp):
         return sorted(_glob.glob(os.path.join(rp, f"*{suffix}")))
     if loc.is_s3:

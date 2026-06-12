@@ -35,6 +35,26 @@ def test_read_bytes_via_mount(monkeypatch, fake_s3_root, populated_bucket):
     assert arcstore.read_bytes("s3://bkt/data/a.txt") == b"hello a"
 
 
+def test_read_bytes_direct_s3_via_s5cmd_no_boto3(monkeypatch, populated_bucket):
+    """Direct-S3 read (no mount) must work through ``s5cmd cat`` alone.
+
+    Training images often ship s5cmd but not boto3; a boto3-only read path
+    would fail there. Simulate a boto3-less env and assert the CLI path wins.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_boto3(name, *a, **k):
+        if name == "boto3" or name.startswith("boto3."):
+            raise ModuleNotFoundError("No module named 'boto3'")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_boto3)
+    # No mount configured -> direct S3 path; fake s5cmd 'cat' serves it.
+    assert arcstore.read_bytes("s3://bkt/data/a.txt") == b"hello a"
+
+
 def test_open_read_text_via_mount(monkeypatch, fake_s3_root, populated_bucket):
     monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={fake_s3_root / 'bkt'}")
     arcstore.refresh_mounts()

@@ -6,8 +6,10 @@ One path-driven API over three access modes:
 * local filesystems (``/local-ssd``, ``/efs``, ``/tmp``)
 * FUSE-mounted S3 buckets (``ARCSTORE_S3_MOUNTS="bucket=/mountdir,..."``)
 
-Reads may use the mount when one is configured; writes ALWAYS go through
-the S3 API (local write + push) because mountpoint-s3 rejects overwrites.
+Generic reads may use a configured mount; training hot-path helpers default
+to direct S3 and accept explicit ``read_policy="mount"`` for compatibility.
+Writes ALWAYS go through the S3 API (local write + push) because
+mountpoint-s3 rejects overwrites.
 
 Torch-dependent helpers (checkpoint loading, safetensors streaming, DCP
 full-state, datasets) live in :mod:`arcstore.torch` behind the
@@ -33,6 +35,7 @@ from .io import (
 )
 from .location import Location, is_s3, refresh_mounts, resolve, split_s3
 from .logtee import LogTee
+from .run import RunStorage, sync_artifacts
 from .staging import ensure_local_file, stage_to_local
 from .workspace import split_workdir
 
@@ -41,6 +44,7 @@ __version__ = "0.1.0"
 __all__ = [
     "Location",
     "LogTee",
+    "RunStorage",
     "aws_region",
     "detect_format",
     "download_dir",
@@ -58,6 +62,7 @@ __all__ = [
     "split_s3",
     "split_workdir",
     "stage_to_local",
+    "sync_artifacts",
     "track_future",
     "upload_dir",
     "upload_dir_async",

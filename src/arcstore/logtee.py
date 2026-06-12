@@ -6,7 +6,7 @@ Two forms:
   process's output through it from a shell::
 
       exec > >(arcstore-tee "s3://bucket/run/logs/host.log" \
-               --local /tmp/run.log --interval 15) 2>&1
+               --local /local-ssd/run.log --interval 15) 2>&1
 
   stdin is passed through to stdout, appended to the local file, and the
   file is re-uploaded via the S3 API every ``--interval`` seconds while it
@@ -27,12 +27,19 @@ import sys
 import threading
 import time
 
+from ._env import local_ssd_or_tmp
 from .location import is_s3
 from .uploads import upload_file
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_S = 15.0
+DEFAULT_LOGTEE_DIR = "/local-ssd/arcstore/logtee"
+FALLBACK_LOGTEE_DIR = "/tmp/arcstore-tee"
+
+
+def _default_log_dir() -> str:
+    return local_ssd_or_tmp(DEFAULT_LOGTEE_DIR, FALLBACK_LOGTEE_DIR)
 
 
 class _Flusher:
@@ -146,7 +153,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--local",
         default=None,
-        help="local log path (default: /tmp/arcstore-tee/<basename of s3 key>)",
+        help=(
+            "local log path (default: /local-ssd/arcstore/logtee/<basename>, "
+            "or /tmp/arcstore-tee/<basename> when /local-ssd is unavailable)"
+        ),
     )
     parser.add_argument(
         "--interval",
@@ -154,12 +164,27 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_INTERVAL_S,
         help=f"seconds between uploads (default {DEFAULT_INTERVAL_S:g})",
     )
+    parser.add_argument(
+        "--chunked",
+        action="store_true",
+        help="write seq-00000.log chunks under s3_uri treated as a prefix",
+    )
+    parser.add_argument(
+        "--chunk-bytes",
+        type=int,
+        default=64 * 1024 * 1024,
+        help="rotate chunked logs after this many bytes",
+    )
     args = parser.parse_args(argv)
 
     if not is_s3(args.s3_uri):
         parser.error(f"destination must be an s3:// URI, got {args.s3_uri!r}")
+
+    if args.chunked:
+        return _main_chunked(args)
+
     local = args.local or os.path.join(
-        "/tmp/arcstore-tee", os.path.basename(args.s3_uri.rstrip("/")) or "run.log"
+        _default_log_dir(), os.path.basename(args.s3_uri.rstrip("/")) or "run.log"
     )
     os.makedirs(os.path.dirname(local) or ".", exist_ok=True)
 
@@ -175,6 +200,55 @@ def main(argv: list[str] | None = None) -> int:
                 f.flush()
     finally:
         flusher.close()
+    return 0
+
+
+def _main_chunked(args) -> int:
+    prefix = args.s3_uri.rstrip("/")
+    local_dir = args.local or os.path.join(
+        _default_log_dir(), os.path.basename(prefix) or "chunks"
+    )
+    os.makedirs(local_dir, exist_ok=True)
+    stdout = sys.stdout.buffer
+    chunk_idx = 0
+    chunk_size = 0
+    last_upload = 0.0
+    f = None
+    path = ""
+
+    def _open_chunk(idx: int):
+        p = os.path.join(local_dir, f"seq-{idx:05d}.log")
+        return p, open(p, "ab")
+
+    def _upload_current() -> None:
+        nonlocal last_upload
+        if f is not None:
+            f.flush()
+        if path and os.path.getsize(path) > 0:
+            upload_file(path, f"{prefix}/seq-{chunk_idx:05d}.log")
+            last_upload = time.monotonic()
+
+    path, f = _open_chunk(chunk_idx)
+    try:
+        for line in iter(sys.stdin.buffer.readline, b""):
+            stdout.write(line)
+            stdout.flush()
+            f.write(line)
+            f.flush()
+            chunk_size += len(line)
+            now = time.monotonic()
+            if now - last_upload >= max(1.0, float(args.interval)):
+                _upload_current()
+            if chunk_size >= max(1, int(args.chunk_bytes)):
+                _upload_current()
+                f.close()
+                chunk_idx += 1
+                chunk_size = 0
+                path, f = _open_chunk(chunk_idx)
+    finally:
+        if f is not None:
+            _upload_current()
+            f.close()
     return 0
 
 

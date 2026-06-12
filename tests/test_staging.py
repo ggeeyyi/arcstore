@@ -1,6 +1,10 @@
 import os
 
+import pytest
+
 import arcstore
+import arcstore._env as env_mod
+import arcstore.staging as staging_mod
 
 
 def _make_ckpt_bucket(fake_s3_root):
@@ -9,6 +13,28 @@ def _make_ckpt_bucket(fake_s3_root):
     (base / "model.pt").write_bytes(b"primary")
     (base / "model_ema.pt").write_bytes(b"ema")
     return base
+
+
+def test_default_cache_root_prefers_local_ssd(monkeypatch):
+    monkeypatch.delenv("ARCSTORE_CACHE_DIR", raising=False)
+    monkeypatch.setattr(env_mod, "_local_ssd_usable", lambda root="/local-ssd": True)
+
+    assert staging_mod._cache_root() == "/local-ssd/arcstore/cache"
+
+
+def test_default_cache_root_falls_back_to_tmp(monkeypatch):
+    monkeypatch.delenv("ARCSTORE_CACHE_DIR", raising=False)
+    monkeypatch.setattr(env_mod, "_local_ssd_usable", lambda root="/local-ssd": False)
+
+    assert staging_mod._cache_root() == "/tmp/arcstore-cache"
+
+
+def test_cache_root_env_override_wins(monkeypatch, tmp_path):
+    override = tmp_path / "explicit-cache"
+    monkeypatch.setenv("ARCSTORE_CACHE_DIR", str(override))
+    monkeypatch.setattr(env_mod, "_local_ssd_usable", lambda root="/local-ssd": True)
+
+    assert staging_mod._cache_root() == str(override)
 
 
 def test_stage_s3_with_siblings(fake_s5cmd, tmp_path):
@@ -32,28 +58,23 @@ def test_stage_s3_hit_is_fast_path(fake_s5cmd):
     assert first == second
 
 
-def test_stage_s3_failure_returns_original(fake_s5cmd, monkeypatch):
-    # Every download backend fails -> the original s3 path comes back.
+def test_stage_s3_failure_raises_by_default(fake_s5cmd, monkeypatch):
     monkeypatch.setattr(
         "arcstore.s3cli.download_file",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("backend down")),
     )
     uri = "s3://bkt/none/model.pt"
-    assert arcstore.stage_to_local(uri) == uri
+    with pytest.raises(RuntimeError, match="failed to stage required S3 object"):
+        arcstore.stage_to_local(uri)
 
 
-def test_stage_s3_mount_fallback(monkeypatch, fake_s3_root, fake_s5cmd):
-    """Download backends down, but the bucket is mounted -> mount path."""
-    monkeypatch.setattr(
-        "arcstore.s3cli.download_file",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("backend down")),
-    )
-    base = _make_ckpt_bucket(fake_s3_root)
-    monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={fake_s3_root / 'bkt'}")
-    arcstore.refresh_mounts()
+def test_stage_s3_cache_prepare_failure_is_strict(fake_s5cmd, tmp_path):
+    cache_root = tmp_path / "cache-file"
+    cache_root.write_text("not a dir")
     uri = "s3://bkt/run/checkpoints/checkpoint_model_000100/model.pt"
-    staged = arcstore.stage_to_local(uri)
-    assert staged == str(base / "model.pt")
+
+    with pytest.raises(RuntimeError, match="failed to prepare S3 staging cache"):
+        arcstore.stage_to_local(uri, cache_root=str(cache_root))
 
 
 def test_stage_local_dir(tmp_path, monkeypatch):

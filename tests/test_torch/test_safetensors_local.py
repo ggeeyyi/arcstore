@@ -30,12 +30,69 @@ def test_auto_local_nonzero_rank_mmaps(st_dir, monkeypatch):
     assert set(out) == {"a", "b", "c"}
 
 
+def test_auto_mount_default_uses_direct_s3(st_dir, monkeypatch):
+    monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={st_dir}")
+    import arcstore
+    from arcstore.torch import safetensors as st_mod
+
+    arcstore.refresh_mounts()
+    seen = {}
+
+    def fake_streamer(path, **kwargs):
+        seen["path"] = path
+        return {"ok": torch.ones(1)}
+
+    monkeypatch.setattr(st_mod, "load_safetensors_streamer", fake_streamer)
+    out = load_safetensors_auto("s3://bkt")
+    assert set(out) == {"ok"}
+    assert seen["path"] == "s3://bkt"
+
+
 def test_auto_mount_rewrite(st_dir, monkeypatch):
     monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={st_dir}")
     import arcstore
 
     arcstore.refresh_mounts()
-    out = load_safetensors_auto("s3://bkt")
+    out = load_safetensors_auto("s3://bkt", read_policy="mount")
+    assert set(out) == {"a", "b", "c"}
+
+
+def test_auto_mount_rewrite_skips_streamer(st_dir, monkeypatch):
+    """FUSE-mounted s3:// must mmap, NOT call run:ai streamer (deadlock)."""
+    monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={st_dir}")
+    import arcstore
+    from arcstore.torch import safetensors as st_mod
+
+    arcstore.refresh_mounts()
+
+    called = {"n": 0}
+
+    def _boom(*a, **kw):
+        called["n"] += 1
+        raise AssertionError("streamer must not be called on mount-rewritten path")
+
+    monkeypatch.setattr(st_mod, "load_safetensors_streamer", _boom)
+    out = load_safetensors_auto("s3://bkt", read_policy="mount")
+    assert set(out) == {"a", "b", "c"}
+    assert called["n"] == 0
+
+
+def test_auto_mount_rewrite_nonzero_rank_also_mmaps(st_dir, monkeypatch):
+    """Even rank 0 must mmap on a mount — no streamer."""
+    monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={st_dir}")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    import arcstore
+    from arcstore.torch import safetensors as st_mod
+
+    arcstore.refresh_mounts()
+    monkeypatch.setattr(
+        st_mod,
+        "load_safetensors_streamer",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("streamer must not be called on mount-rewritten path")
+        ),
+    )
+    out = load_safetensors_auto("s3://bkt", read_policy="mount")
     assert set(out) == {"a", "b", "c"}
 
 

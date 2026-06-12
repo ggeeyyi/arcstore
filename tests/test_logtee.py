@@ -3,6 +3,20 @@ import subprocess
 import sys
 
 import arcstore
+import arcstore._env as env_mod
+import arcstore.logtee as logtee_mod
+
+
+def test_default_log_dir_prefers_local_ssd(monkeypatch):
+    monkeypatch.setattr(env_mod, "_local_ssd_usable", lambda root="/local-ssd": True)
+
+    assert logtee_mod._default_log_dir() == "/local-ssd/arcstore/logtee"
+
+
+def test_default_log_dir_falls_back_to_tmp(monkeypatch):
+    monkeypatch.setattr(env_mod, "_local_ssd_usable", lambda root="/local-ssd": False)
+
+    assert logtee_mod._default_log_dir() == "/tmp/arcstore-tee"
 
 
 def test_cli_tee_roundtrip(fake_s5cmd, fake_s3_root, tmp_path):
@@ -34,6 +48,37 @@ def test_cli_tee_roundtrip(fake_s5cmd, fake_s3_root, tmp_path):
     # final flush uploaded to (fake) S3
     remote = fake_s3_root / "bkt" / "logs" / "run.log"
     assert remote.read_bytes() == b"line one\nline two\n"
+
+
+def test_cli_tee_chunked(fake_s5cmd, fake_s3_root, tmp_path):
+    local = tmp_path / "chunks"
+    env = os.environ.copy()
+    src_dir = os.path.join(os.path.dirname(__file__), "..", "src")
+    env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "arcstore.logtee",
+            "s3://bkt/logs/chunked",
+            "--local",
+            str(local),
+            "--interval",
+            "60",
+            "--chunked",
+            "--chunk-bytes",
+            "8",
+        ],
+        input=b"line one\nline two\n",
+        capture_output=True,
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert proc.stdout == b"line one\nline two\n"
+    remote = fake_s3_root / "bkt" / "logs" / "chunked"
+    assert (remote / "seq-00000.log").read_bytes() == b"line one\n"
+    assert (remote / "seq-00001.log").read_bytes() == b"line two\n"
 
 
 def test_cli_rejects_non_s3(tmp_path):

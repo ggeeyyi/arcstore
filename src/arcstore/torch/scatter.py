@@ -26,6 +26,7 @@ import torch
 from torch.utils.data import IterableDataset
 
 from .._env import aws_region
+from .._env import read_policy as _read_policy
 from ..location import resolve
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ class ScatterPtDataset(IterableDataset):
         shuffle_buffer: int = 1000,
         length: Optional[int] = None,
         use_mount: bool | None = None,
+        read_policy: str | None = None,
     ):
         super().__init__()
         self.uri = uri
@@ -79,6 +81,17 @@ class ScatterPtDataset(IterableDataset):
         self.region = region or aws_region()
         self.shuffle_buffer = shuffle_buffer
         self._length = length
+
+        if use_mount is True:
+            policy = "mount"
+        elif use_mount is False:
+            policy = "direct_s3"
+        else:
+            policy = _read_policy(
+                read_policy,
+                env_name="ARCSTORE_DATA_READ_POLICY",
+                default="direct_s3",
+            )
 
         loc = resolve(uri)
         rp = loc.read_path() if loc.is_s3 else loc.local_path
@@ -91,7 +104,7 @@ class ScatterPtDataset(IterableDataset):
         self._local_dir: str | None
         if not loc.is_s3:
             self._local_dir = rp
-        elif mount_usable and use_mount is not False:
+        elif mount_usable and policy in ("auto", "mount"):
             self._local_dir = rp
             logger.info(f"[arcstore-scatter] reading {uri} via mount {rp}")
         else:

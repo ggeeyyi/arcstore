@@ -38,13 +38,15 @@ def test_rank_sharding(pt_dir, monkeypatch):
     assert n0 == n1 == 4
 
 
-def test_mount_redirect(pt_dir, monkeypatch):
-    """An s3:// uri with a mounted bucket iterates the mount dir locally."""
+def test_mount_redirect_requires_policy(pt_dir, monkeypatch):
+    """Mounted buckets are explicit for training hot paths."""
     monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={pt_dir}")
     import arcstore
 
     arcstore.refresh_mounts()
     ds = ScatterPtDataset("s3://bkt", shuffle_buffer=1)
+    assert ds._local_dir is None
+    ds = ScatterPtDataset("s3://bkt", read_policy="mount", shuffle_buffer=1)
     assert ds._local_dir == str(pt_dir)
     assert len(list(ds)) == 8
 

@@ -11,12 +11,14 @@ Generalized from CausalVideoDiffusion ``src/utils/ckpt_cache.py``:
   configs): size-checked cache hit, atomic tmp+rename download.
 
 Concurrency: per-checkpoint ``fcntl.flock`` + a ``.stage_done`` sentinel.
-Failure handling: every external dependency falls through to returning the
-*original* path — a flaky cache must never block a run.
+Failure handling: local staging falls back to the original path, while S3
+staging is strict by default so missing checkpoints fail at the real cause
+instead of surfacing later as an opaque ``torch.load`` error.
 
 Env knobs (read at call time, overridable per-call):
 
-* ``ARCSTORE_CACHE_DIR``         — cache root (default ``/tmp/arcstore-cache``)
+* ``ARCSTORE_CACHE_DIR``         — cache root (default
+  ``/local-ssd/arcstore/cache`` when available, else ``/tmp/arcstore-cache``)
 * ``ARCSTORE_CACHE_ENABLE``      — ``0``/``false`` bypasses staging
 * ``ARCSTORE_CACHE_BUDGET_GIB``  — LRU eviction budget (default 200)
 * ``ARCSTORE_STAGE_PREFIXES``    — optional comma-separated whitelist of
@@ -33,10 +35,11 @@ import time
 from typing import Optional, Sequence
 
 from . import s3cli
-from ._env import env_bool, env_float, env_str
+from ._env import env_bool, env_float, env_str, local_ssd_or_tmp
 from .location import is_s3, resolve
 
-DEFAULT_CACHE_DIR = "/tmp/arcstore-cache"
+DEFAULT_CACHE_DIR = "/local-ssd/arcstore/cache"
+FALLBACK_CACHE_DIR = "/tmp/arcstore-cache"
 
 _module_logger = logging.getLogger(__name__)
 
@@ -46,7 +49,8 @@ def _get_logger(logger):
 
 
 def _cache_root(override: str | None = None) -> str:
-    return override or env_str("ARCSTORE_CACHE_DIR", DEFAULT_CACHE_DIR)
+    default = local_ssd_or_tmp(DEFAULT_CACHE_DIR, FALLBACK_CACHE_DIR)
+    return override or env_str("ARCSTORE_CACHE_DIR", default)
 
 
 def _budget_bytes(override_gib: float | None = None) -> int:
@@ -100,8 +104,8 @@ def stage_to_local(
     For a local (slow-mount) source the containing directory's flat files
     are copied when ``copy_whole_dir`` is true.
 
-    On any error returns the original ``path`` so the caller's load still
-    works, just slowly.
+    S3 staging failures raise immediately so missing or unreadable remote
+    checkpoints fail at the real cause.
     """
     log = _get_logger(logger)
     root = _cache_root(cache_root)
@@ -215,11 +219,9 @@ def _stage_s3_dir(
     try:
         os.makedirs(cache_subdir, exist_ok=True)
     except OSError as e:
-        logger.warning(
-            f"[arcstore] cannot create {cache_subdir} ({e}); "
-            f"returning original s3 path."
-        )
-        return s3_path
+        raise RuntimeError(
+            f"[arcstore] failed to prepare S3 staging cache {cache_subdir!r}: {e}"
+        ) from e
 
     if os.path.isfile(sentinel) and os.path.isfile(staged_path):
         try:
@@ -234,37 +236,38 @@ def _stage_s3_dir(
         if sib != fname:
             targets.append((sib, False))
 
-    def _download_one(basename: str, required: bool) -> bool:
+    def _download_one(basename: str, required: bool) -> tuple[bool, Exception | None]:
         local = os.path.join(cache_subdir, basename)
         if os.path.isfile(local):
-            return True
+            return True, None
         s3_uri = f"{s3_parent.rstrip('/')}/{basename}"
         try:
             s3cli.download_file(s3_uri, local, label="arcstore-stage")
-            return True
-        except FileNotFoundError:
+            return True, None
+        except FileNotFoundError as e:
             if required:
                 logger.warning(f"[arcstore] required object missing: {s3_uri}")
-            return False
+            return False, e
         except Exception as e:  # noqa: BLE001
             level = logger.warning if required else logger.info
-            level(f"[arcstore] fetch {s3_uri} failed ({e}); "
-                  + ("" if required else "continuing."))
-            return False
+            level(
+                f"[arcstore] fetch {s3_uri} failed ({e}); "
+                + ("" if required else "continuing.")
+            )
+            return False, e
 
     logger.info(
         f"[arcstore] s3-staging {fname} (+{len(targets) - 1} optional sibling(s)) "
         f"from {s3_parent}/ -> {cache_subdir}/"
     )
     t0 = time.perf_counter()
-    if not _download_one(fname, required=True):
-        # Last resort: a mounted bucket still serves reads without any CLI.
-        rp = resolve(s3_path).read_path()
-        if rp is not None and os.path.isfile(rp):
-            logger.info(f"[arcstore] falling back to mounted read path {rp}")
-            return rp
-        logger.warning("[arcstore] primary fetch failed; returning original s3 path.")
-        return s3_path
+    ok, err = _download_one(fname, required=True)
+    if not ok:
+        if isinstance(err, FileNotFoundError):
+            raise err
+        raise RuntimeError(
+            f"[arcstore] failed to stage required S3 object {s3_path!r}: {err}"
+        ) from err
     for basename, required in targets[1:]:
         _download_one(basename, required=required)
 
@@ -275,7 +278,10 @@ def _stage_s3_dir(
     try:
         sz = os.path.getsize(staged_path) / (1024**3)
         rate = f", {sz * 1024 / dt:.0f} MiB/s" if dt > 0 else ""
-        logger.info(f"[arcstore] s3-staged {sz:.1f} GiB in {dt:.1f}s{rate} -> {staged_path}")
+        logger.info(
+            f"[arcstore] s3-staged {sz:.1f} GiB in {dt:.1f}s{rate} "
+            f"-> {staged_path}"
+        )
     except OSError:
         logger.info(f"[arcstore] s3-staged in {dt:.1f}s -> {staged_path}")
 

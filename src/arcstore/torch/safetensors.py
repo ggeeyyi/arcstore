@@ -1,11 +1,24 @@
 """S3-native safetensors loading (run:ai Model Streamer) with mount rewrite.
 
 Lifted from CausalVideoDiffusion ``src/utils/streamer_load.py``.
-``load_safetensors_auto`` (the old ``load_safetensors_via_node_cache``) is
-mount-aware: an ``s3://`` source whose bucket is FUSE-mounted is rewritten
-to the mount path and takes the local branch — rank 0 streams, sibling
-ranks mmap the same FUSE-backed files and the kernel page cache dedups, so
-there is no per-rank S3 read amplification.
+``load_safetensors_auto`` is mount-aware: an ``s3://`` source whose bucket
+is FUSE-mounted is rewritten to the mount path and **every rank just
+mmaps the on-disk shards directly** (kernel page cache dedups across
+ranks; no S3 read amplification).
+
+Why the streamer is NOT used on FUSE-mounted paths
+--------------------------------------------------
+Empirically observed deadlock: when ``runai-model-streamer`` is pointed
+at a path under a ``mountpoint-s3`` mount with concurrency=32, the
+streamer's many concurrent range reads can hang the FUSE layer
+indefinitely (no error, no progress). The streamer is designed for
+direct ``s3://`` reads — let it do that, and let mmap handle FUSE.
+
+Resulting decision matrix:
+
+* direct ``s3://`` (no mount)   — every rank uses run:ai streamer
+* ``s3://`` rewritten to mount  — every rank mmaps the mount path
+* plain local file/dir          — rank 0 uses streamer, siblings mmap
 
 Critical: ``RUNAI_STREAMER_MEMORY_LIMIT`` MUST be bounded. ``-1``
 (unlimited) deadlocks on multi-shard reads because the streamer tries to
@@ -20,6 +33,8 @@ import time
 
 import torch
 
+from .._env import read_policy as _read_policy
+from .._env import streamer_concurrency, streamer_memory_limit
 from ..io import glob_files
 from ..location import is_s3 as _is_s3
 from ..location import resolve
@@ -33,17 +48,17 @@ DEFAULT_MEMORY_LIMIT = "34359738368"
 DEFAULT_CONCURRENCY = 32
 
 
-def _force_streamer_envs(concurrency: int) -> None:
+def _force_streamer_envs(concurrency: int, memory_limit: str) -> None:
     """OVERWRITE the streamer env vars unconditionally.
 
     Why not ``setdefault``: a leftover ``RUNAI_STREAMER_MEMORY_LIMIT=-1`` in
     the container env would silently keep the documented deadlock.
     """
     os.environ["RUNAI_STREAMER_CONCURRENCY"] = str(concurrency)
-    os.environ["RUNAI_STREAMER_MEMORY_LIMIT"] = DEFAULT_MEMORY_LIMIT
+    os.environ["RUNAI_STREAMER_MEMORY_LIMIT"] = str(memory_limit)
 
 
-def _list_safetensors(prefix: str) -> list[str]:
+def _list_safetensors(prefix: str, *, read_policy: str | None = None) -> list[str]:
     """Sorted ``*.safetensors`` files under ``prefix`` (file, dir, or s3)."""
     if prefix.endswith(".safetensors"):
         return [prefix]
@@ -58,7 +73,7 @@ def _list_safetensors(prefix: str) -> list[str]:
     except ImportError:
         pass  # fall through for dev/test environments without runai
 
-    files = glob_files(prefix, ".safetensors")
+    files = glob_files(prefix, ".safetensors", read_policy=read_policy)
     if not files:
         raise FileNotFoundError(f"No *.safetensors under {prefix!r}")
     return files
@@ -67,7 +82,8 @@ def _list_safetensors(prefix: str) -> list[str]:
 def load_safetensors_streamer(
     uri_or_dir: str,
     *,
-    concurrency: int = DEFAULT_CONCURRENCY,
+    concurrency: int | None = None,
+    memory_limit: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """Return a CPU state_dict by streaming ``*.safetensors`` from ``uri_or_dir``.
 
@@ -75,17 +91,23 @@ def load_safetensors_streamer(
     ``safetensors.torch.load_file`` for **local** paths. ``s3://`` inputs
     require ``runai-model-streamer-s3``.
     """
-    files = _list_safetensors(uri_or_dir)
+    files = _list_safetensors(uri_or_dir, read_policy="direct_s3")
+    concurrency = int(
+        concurrency
+        if concurrency is not None
+        else streamer_concurrency(DEFAULT_CONCURRENCY)
+    )
+    memory_limit = memory_limit or streamer_memory_limit(DEFAULT_MEMORY_LIMIT)
     n_files = len(files)
     log_target = files[0] if n_files == 1 else f"{n_files} shards in {uri_or_dir}"
     logger.info(
         f"[arcstore-streamer] loading {log_target} (concurrency={concurrency}, "
-        f"memory_limit={DEFAULT_MEMORY_LIMIT} bytes)"
+        f"memory_limit={memory_limit} bytes)"
     )
 
     # Force-set envs BEFORE the streamer import — the C++ runtime captures
     # them on first SafetensorsStreamer() instantiation.
-    _force_streamer_envs(concurrency)
+    _force_streamer_envs(concurrency, memory_limit)
 
     t0 = time.perf_counter()
     try:
@@ -136,35 +158,71 @@ def _load_file_mmap(local_path: str) -> dict[str, torch.Tensor]:
 def load_safetensors_auto(
     uri_or_dir: str,
     *,
-    concurrency: int = DEFAULT_CONCURRENCY,
+    concurrency: int | None = None,
+    memory_limit: str | None = None,
+    read_policy: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """Load safetensors choosing the best path per source.
 
     * **direct ``s3://``** — every rank streams via run:ai Model Streamer.
-    * **mounted ``s3://``** — rewritten to the mount path, then handled as
-      local (page-cache shared across ranks, no S3 read amplification).
+    * **mounted ``s3://``** — rewritten to the FUSE mount path; every rank
+      mmaps the on-disk shards directly. The kernel page cache dedups
+      across same-node ranks, so there is no S3 read amplification, and
+      we sidestep the streamer-on-FUSE deadlock (32-way range reads on a
+      mountpoint-s3 path can hang indefinitely).
     * **local file/dir** — rank 0 uses the streamer (fast); other local
       ranks mmap the same on-disk shards. No extra copy.
     """
     loc = resolve(uri_or_dir)
+    policy = _read_policy(
+        read_policy,
+        env_name="ARCSTORE_MODEL_READ_POLICY",
+        default="direct_s3",
+    )
     rp = loc.read_path()
-    if loc.is_s3 and rp is not None and os.path.exists(rp):
-        logger.info(f"[arcstore-streamer] using mounted path {rp} for {uri_or_dir}")
-        uri_or_dir = rp
-    elif loc.is_s3:
+    if (
+        loc.is_s3
+        and policy in ("auto", "mount")
+        and rp is not None
+        and os.path.exists(rp)
+    ):
+        # FUSE-mounted s3:// source. Bypass the streamer entirely on
+        # every rank — the streamer's concurrent range reads deadlock
+        # on mountpoint-s3 paths. mmap is safe and the kernel page
+        # cache dedups across ranks.
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        files = _list_safetensors(rp)
+        logger.info(
+            f"[arcstore-mmap] rank{local_rank} mmap-loading {len(files)} "
+            f"shard(s) from mounted path {rp} (rewritten from {uri_or_dir}); "
+            f"runai-streamer skipped to avoid FUSE deadlock"
+        )
+        out: dict[str, torch.Tensor] = {}
+        for f in files:
+            out.update(_load_file_mmap(f))
+        return out
+    if loc.is_s3:
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         logger.info(
             f"[arcstore-streamer] rank{local_rank} loading S3 safetensors "
             f"directly from {uri_or_dir}"
         )
-        return load_safetensors_streamer(uri_or_dir, concurrency=concurrency)
+        return load_safetensors_streamer(
+            uri_or_dir,
+            concurrency=concurrency,
+            memory_limit=memory_limit,
+        )
 
-    # Local (or mounted) source: rank 0 uses the streamer; others mmap.
+    # Plain local source: rank 0 uses the streamer; others mmap.
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if local_rank == 0:
-        return load_safetensors_streamer(uri_or_dir, concurrency=concurrency)
+        return load_safetensors_streamer(
+            uri_or_dir,
+            concurrency=concurrency,
+            memory_limit=memory_limit,
+        )
     files = _list_safetensors(uri_or_dir)
-    out: dict[str, torch.Tensor] = {}
+    out = {}
     for f in files:
         out.update(_load_file_mmap(f))
     logger.info(

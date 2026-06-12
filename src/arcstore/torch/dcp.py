@@ -21,31 +21,50 @@ Staging roots (env, read at call time):
 
 * ``ARCSTORE_DCP_STAGE_DIR`` — S3-load staging (default
   ``/local-ssd/arcstore/dcp_load``)
-* save fallback (no s3torchconnector): ``/tmp/arcstore/dcp_save``
+* ``ARCSTORE_DCP_SAVE_STAGE_DIR`` — S3-save fallback staging when
+  ``s3torchconnector`` is unavailable (default
+  ``/local-ssd/arcstore/dcp_save`` when available, else
+  ``/tmp/arcstore/dcp_save``)
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Iterable, List, Union
+from typing import Any, Iterable, List, Mapping, Union
 
 import torch
 import torch.distributed as dist
 
-from .._env import aws_region, env_str
-from ..location import is_s3, split_s3
+from .._env import aws_region, env_str, local_ssd_or_tmp
+from ..io import exists
+from ..location import is_s3
 from ..uploads import download_dir, track_future, upload_dir, upload_file
 
 logger = logging.getLogger(__name__)
 
-_DCP_SAVE_STAGE = "/tmp/arcstore/dcp_save"
+_DCP_SAVE_STAGE = "/local-ssd/arcstore/dcp_save"
+_DCP_SAVE_STAGE_FALLBACK = "/tmp/arcstore/dcp_save"
 
 
 def _load_stage_root() -> str:
     return env_str("ARCSTORE_DCP_STAGE_DIR", "/local-ssd/arcstore/dcp_load")
+
+
+def _save_stage_root() -> str:
+    default = local_ssd_or_tmp(_DCP_SAVE_STAGE, _DCP_SAVE_STAGE_FALLBACK)
+    return env_str("ARCSTORE_DCP_SAVE_STAGE_DIR", default)
+
+
+def _stage_dir_for_s3(root: str, uri: str) -> str:
+    """Stable, collision-resistant local stage dir for one S3 DCP prefix."""
+    norm = uri.rstrip("/")
+    basename = norm.rsplit("/", 1)[-1] or "dcp"
+    key = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(root, f"{key}__{basename}")
 
 
 def _as_list(x) -> List:
@@ -215,27 +234,85 @@ def prime_optim_state(models, optimizers) -> None:
 
 
 # ---------------------------------------------------------------------------
-# step side-file
+# side-files / metadata
 # ---------------------------------------------------------------------------
-def _save_train_meta(dest: str, step: int) -> None:
-    meta = {"step": int(step)}
+def _state_dict_or_value(obj):
+    if obj is None:
+        return None
+    if hasattr(obj, "state_dict"):
+        return obj.state_dict()
+    return obj
+
+
+def _load_state_dict_or_return(target, state):
+    if target is not None and state is not None and hasattr(target, "load_state_dict"):
+        target.load_state_dict(state)
+    return state
+
+
+def _save_torch_side_file(dest: str, name: str, obj: Any) -> None:
     if is_s3(dest):
-        local = tempfile.mktemp(suffix=".pt")
-        torch.save(meta, local)
-        upload_file(local, dest.rstrip("/") + "/train_meta.pt")
-        os.remove(local)
+        root = _save_stage_root()
+        os.makedirs(root, exist_ok=True)
+        fd, local = tempfile.mkstemp(suffix=".pt", dir=root)
+        os.close(fd)
+        try:
+            torch.save(obj, local)
+            upload_file(local, dest.rstrip("/") + "/" + name.lstrip("/"))
+        finally:
+            try:
+                os.remove(local)
+            except FileNotFoundError:
+                pass
     else:
         Path(dest).mkdir(parents=True, exist_ok=True)
-        torch.save(meta, str(Path(dest) / "train_meta.pt"))
+        target = Path(dest) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(obj, str(target))
 
 
-def _load_train_meta(local_dir: str) -> int:
+def _save_train_meta(
+    dest: str,
+    step: int,
+    *,
+    scheduler=None,
+    extra_state: Mapping[str, Any] | None = None,
+) -> None:
+    meta = {
+        "step": int(step),
+        "scheduler": _state_dict_or_value(scheduler),
+        "extra_state": dict(extra_state or {}),
+    }
+    _save_torch_side_file(dest, "train_meta.pt", meta)
+
+
+def _load_train_meta(local_dir: str, *, scheduler=None) -> dict[str, Any]:
     p = Path(local_dir) / "train_meta.pt"
     if not p.exists():
         logger.warning("[arcstore-dcp] no train_meta.pt at %s; step=0", local_dir)
-        return 0
+        return {"step": 0, "scheduler": None, "extra_state": {}}
     meta = torch.load(str(p), map_location="cpu", weights_only=False)
-    return int(meta.get("step", 0))
+    _load_state_dict_or_return(scheduler, meta.get("scheduler"))
+    meta["step"] = int(meta.get("step", 0))
+    meta.setdefault("extra_state", {})
+    return meta
+
+
+def _save_named_side_files(dest: str, side_files: Mapping[str, Any] | None) -> None:
+    for name, obj in (side_files or {}).items():
+        _save_torch_side_file(dest, name, _state_dict_or_value(obj))
+
+
+def _load_ema(local_dir: str, ema) -> bool:
+    if ema is None:
+        return False
+    p = Path(local_dir) / "ema.pt"
+    if not p.exists():
+        logger.warning("[arcstore-dcp] no ema.pt at %s; skipping EMA restore", local_dir)
+        return False
+    state = torch.load(str(p), map_location="cpu", weights_only=False)
+    ema.load_state_dict(state)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -247,14 +324,20 @@ def save_full_state(
     optimizers,
     *,
     step: int = 0,
+    scheduler=None,
+    ema=None,
+    extra_state: Mapping[str, Any] | None = None,
+    side_files: Mapping[str, Any] | None = None,
     async_save: bool = False,
     thread_count: int = 8,
 ) -> None:
     """Save the complete FSDP training state (model + optimizer) to ``dest``.
 
     ``dest`` is an ``s3://`` prefix (streamed via ``S3StorageWriter``) or a
-    local directory (DCP ``FileSystem`` writer). The global ``step`` is
-    written as a rank-0 ``train_meta.pt`` side-file. With ``async_save`` the
+    local directory (DCP ``FileSystem`` writer). The global ``step`` plus
+    optional scheduler / extra metadata are written as a rank-0
+    ``train_meta.pt`` side-file. Optional ``ema`` is written as rank-0
+    ``ema.pt``. With ``async_save`` the
     tensor write runs off the critical path and its future is registered
     with :func:`arcstore.wait_for_uploads` for a shutdown flush.
     """
@@ -264,7 +347,10 @@ def save_full_state(
     t0 = time.perf_counter()
 
     if _rank() == 0:
-        _save_train_meta(dest, step)
+        _save_train_meta(dest, step, scheduler=scheduler, extra_state=extra_state)
+        if ema is not None:
+            _save_torch_side_file(dest, "ema.pt", _state_dict_or_value(ema))
+        _save_named_side_files(dest, side_files)
 
     # Local destination: plain DCP FileSystem write.
     if not is_s3(dest):
@@ -310,7 +396,13 @@ def save_full_state(
         )
     except ImportError:
         # Fallback: DCP to local FileSystem, then parallel s5cmd upload.
-        local = os.path.join(_DCP_SAVE_STAGE, dest.rstrip("/").split("/")[-1])
+        local = _stage_dir_for_s3(_save_stage_root(), dest)
+        if _rank() == 0 and os.path.isdir(local):
+            import shutil
+
+            shutil.rmtree(local)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
         Path(local).mkdir(parents=True, exist_ok=True)
         dcp.save(app, checkpoint_id=local)
         if _rank() == 0:
@@ -326,7 +418,11 @@ def load_full_state(
     src: str,
     models: Union[torch.nn.Module, Iterable[torch.nn.Module]],
     optimizers,
-) -> int:
+    *,
+    scheduler=None,
+    ema=None,
+    return_meta: bool = False,
+) -> int | dict[str, Any]:
     """Restore the complete FSDP training state from ``src``. Returns global step.
 
     ``src`` may be an ``s3://`` prefix (shards staged to local NVMe with
@@ -351,9 +447,9 @@ def load_full_state(
         dcp.load(app, checkpoint_id=src, planner=planner)
         load_dir = src
     else:
-        load_dir = os.path.join(_load_stage_root(), src.rstrip("/").split("/")[-1])
+        load_dir = _stage_dir_for_s3(_load_stage_root(), src)
         if _local_rank() == 0:
-            download_dir(src, load_dir, workers=256)
+            download_dir(src, load_dir, workers=256, required_files=(".metadata",))
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
         dcp.load(app, checkpoint_id=load_dir, planner=planner)
@@ -369,41 +465,22 @@ def load_full_state(
                     if isinstance(v, torch.Tensor) and v.device != p.device:
                         st[k] = v.to(p.device)
 
-    step = _load_train_meta(load_dir)
+    meta = _load_train_meta(load_dir, scheduler=scheduler)
+    _load_ema(load_dir, ema)
+    step = int(meta.get("step", 0))
     logger.info(
         "[arcstore-dcp] loaded <- %s in %.2fs (step=%d)",
         src,
         time.perf_counter() - t0,
         step,
     )
-    return int(step)
+    return meta if return_meta else int(step)
 
 
 def dcp_dir_exists(path: str) -> bool:
     """True if ``path`` looks like a populated DCP checkpoint dir (local or s3)."""
     if is_s3(path):
-        import shutil
-        import subprocess
-
-        listing = path.rstrip("/") + "/"
-        if shutil.which("s5cmd"):
-            proc = subprocess.run(
-                ["s5cmd", "ls", listing],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            return proc.returncode == 0 and bool(proc.stdout.strip())
-        try:
-            import boto3
-
-            bucket, key = split_s3(listing)
-            resp = boto3.client("s3").list_objects_v2(
-                Bucket=bucket, Prefix=key, MaxKeys=1
-            )
-            return resp.get("KeyCount", 0) > 0
-        except Exception:
-            return False
+        return exists(path.rstrip("/") + "/.metadata")
     # Local: DCP writes a ``.metadata`` file at the root.
     return os.path.isdir(path) and os.path.exists(os.path.join(path, ".metadata"))
 

@@ -21,14 +21,13 @@ from __future__ import annotations
 import atexit
 import logging
 import os
-import shutil
-import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 from ._env import default_workers
 from .location import is_s3, split_s3
+from .s3cli import have_aws, have_s5cmd, run_cli_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -98,15 +97,23 @@ def upload_file(local_path: str, s3_uri: str, *, workers: int | None = None) -> 
     if not is_s3(s3_uri):
         raise ValueError(f"upload_file expects an s3:// destination, got {s3_uri!r}")
     workers = workers if workers is not None else default_workers()
-    if shutil.which("s5cmd"):
-        cmd = ["s5cmd", "--numworkers", str(workers), "cp", local_path, s3_uri]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode == 0:
-            return
+    candidates: list[tuple[str, list[str]]] = []
+    if have_s5cmd():
+        candidates.append(
+            (
+                "s5cmd",
+                ["s5cmd", "--numworkers", str(workers), "cp", local_path, s3_uri],
+            )
+        )
+    if have_aws():
+        candidates.append(("aws", ["aws", "s3", "cp", local_path, s3_uri]))
+    result, last_err, _not_found = run_cli_candidates(candidates)
+    if result is not None:
+        return
+    if last_err is not None:
         logger.warning(
-            f"[arcstore] s5cmd cp {local_path} -> {s3_uri} failed "
-            f"(rc={proc.returncode}): {(proc.stderr or '').strip()[:300]}; "
-            "falling back to boto3."
+            f"[arcstore] CLI upload {local_path} -> {s3_uri} failed "
+            f"({last_err}); falling back to boto3."
         )
     _boto3_upload_file(local_path, s3_uri)
 
@@ -120,14 +127,20 @@ def upload_dir(
     workers = workers if workers is not None else default_workers()
     src = local_dir.rstrip("/") + "/"
     dst = s3_uri.rstrip("/") + "/"
-    if shutil.which("s5cmd"):
-        cmd = ["s5cmd", "--numworkers", str(workers), "cp", src, dst]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode == 0:
-            return
+    candidates: list[tuple[str, list[str]]] = []
+    if have_s5cmd():
+        candidates.append(
+            ("s5cmd", ["s5cmd", "--numworkers", str(workers), "cp", src, dst])
+        )
+    if have_aws():
+        candidates.append(("aws", ["aws", "s3", "cp", "--recursive", src, dst]))
+    result, last_err, _not_found = run_cli_candidates(candidates)
+    if result is not None:
+        return
+    if last_err is not None:
         logger.warning(
-            f"[arcstore] s5cmd cp dir failed (rc={proc.returncode}): "
-            f"{(proc.stderr or '').strip()[:300]}; falling back to boto3."
+            f"[arcstore] CLI upload dir {local_dir} -> {s3_uri} failed "
+            f"({last_err}); falling back to boto3."
         )
     _boto3_upload_dir(local_dir, s3_uri)
 
@@ -146,11 +159,55 @@ def upload_dir_async(local_dir: str, s3_uri: str) -> None:
     logger.info(f"[arcstore] queued background upload {local_dir}/ -> {s3_uri}/")
 
 
-def download_dir(s3_uri: str, local_dir: str, *, workers: int | None = None) -> None:
+def _count_local_files(local_dir: str) -> int:
+    total = 0
+    for _root, _dirs, files in os.walk(local_dir):
+        total += len(files)
+    return total
+
+
+def _missing_required_files(local_dir: str, required_files) -> list[str]:
+    if not required_files:
+        return []
+    missing: list[str] = []
+    for rel in required_files:
+        if not os.path.isfile(os.path.join(local_dir, rel)):
+            missing.append(rel)
+    return missing
+
+
+def _download_verified(
+    local_dir: str,
+    *,
+    required_files=None,
+    require_nonempty: bool = True,
+) -> tuple[bool, str | None]:
+    missing = _missing_required_files(local_dir, required_files)
+    if missing:
+        return False, f"missing required file(s): {', '.join(missing)}"
+    if require_nonempty and _count_local_files(local_dir) == 0:
+        return False, "downloaded zero files"
+    return True, None
+
+
+def download_dir(
+    s3_uri: str,
+    local_dir: str,
+    *,
+    workers: int | None = None,
+    retries: int = 3,
+    required_files=None,
+    require_nonempty: bool = True,
+) -> None:
     """Download an S3 prefix to a local directory (s5cmd preferred).
 
     Always uses the S3 API even when the bucket is FUSE-mounted: s5cmd's
     multipart fan-out beats FUSE reads for multi-GiB transfers.
+
+    ``s5cmd cp prefix/*`` can occasionally return success before a just-written
+    prefix is visible through LIST. We verify that files landed, optionally
+    check marker files such as DCP ``.metadata``, and retry before falling back
+    to boto3.
     """
     if not is_s3(s3_uri):
         raise ValueError(f"download_dir expects an s3:// source, got {s3_uri!r}")
@@ -158,16 +215,62 @@ def download_dir(s3_uri: str, local_dir: str, *, workers: int | None = None) -> 
     os.makedirs(local_dir, exist_ok=True)
     src = s3_uri.rstrip("/") + "/*"
     dst = local_dir.rstrip("/") + "/"
-    if shutil.which("s5cmd"):
-        cmd = ["s5cmd", "--numworkers", str(workers), "cp", src, dst]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode == 0:
-            return
-        logger.warning(
-            f"[arcstore] s5cmd cp down failed (rc={proc.returncode}): "
-            f"{(proc.stderr or '').strip()[:300]}; falling back to boto3."
+    candidates: list[tuple[str, list[str]]] = []
+    if have_s5cmd():
+        candidates.append(
+            ("s5cmd", ["s5cmd", "--numworkers", str(workers), "cp", src, dst])
         )
-    _boto3_download_dir(s3_uri, local_dir)
+    if have_aws():
+        candidates.append(
+            ("aws", ["aws", "s3", "cp", "--recursive", s3_uri.rstrip("/") + "/", dst])
+        )
+    last_err = None
+    not_found = None
+    verify_err = None
+    if candidates:
+        for attempt in range(max(1, int(retries))):
+            result, last_err, not_found = run_cli_candidates(candidates)
+            if result is not None:
+                ok, reason = _download_verified(
+                    local_dir,
+                    required_files=required_files,
+                    require_nonempty=require_nonempty,
+                )
+                if ok:
+                    return
+                verify_err = (
+                    f"{result.tool} reported success but {reason} "
+                    f"after downloading {s3_uri}"
+                )
+                last_err = verify_err
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            if not_found is not None:
+                break
+            time.sleep(1.0 * (attempt + 1))
+    if not_found is not None:
+        raise FileNotFoundError(f"S3 prefix does not exist: {s3_uri!r} ({not_found})")
+    if last_err is not None:
+        logger.warning(
+            f"[arcstore] CLI download dir {s3_uri} -> {local_dir} failed "
+            f"({last_err}); falling back to boto3."
+        )
+    try:
+        _boto3_download_dir(s3_uri, local_dir)
+    except ModuleNotFoundError as e:
+        if verify_err is not None:
+            raise FileNotFoundError(
+                f"S3 prefix did not produce a complete local dir: {s3_uri!r} "
+                f"({verify_err})"
+            ) from e
+        raise
+    ok, reason = _download_verified(
+        local_dir,
+        required_files=required_files,
+        require_nonempty=require_nonempty,
+    )
+    if not ok:
+        raise FileNotFoundError(f"S3 prefix did not produce a complete local dir: {s3_uri!r} ({reason})")
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +303,15 @@ def _boto3_download_dir(s3_uri: str, local_dir: str) -> None:
     client = boto3.client("s3")
     paginator = client.get_paginator("list_objects_v2")
     base = local_dir.rstrip("/")
+    found = False
     for page in paginator.paginate(Bucket=bucket, Prefix=key_prefix.rstrip("/") + "/"):
         for obj in page.get("Contents", []):
             rel = obj["Key"][len(key_prefix.rstrip("/")) + 1:]
             if not rel:
                 continue
+            found = True
             dst = os.path.join(base, rel)
             os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
             client.download_file(bucket, obj["Key"], dst)
+    if not found:
+        raise FileNotFoundError(f"S3 prefix does not exist or is empty: {s3_uri!r}")

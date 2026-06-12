@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 from dataclasses import dataclass
+from typing import Sequence
 
 from .location import split_s3
 
@@ -50,6 +51,51 @@ class LsEntry:
     is_dir: bool
 
 
+@dataclass(frozen=True)
+class CliRunResult:
+    """Successful S3 CLI invocation."""
+
+    tool: str
+    stdout: str | bytes
+    stderr: str | bytes
+
+
+def run_cli_candidates(
+    candidates: Sequence[tuple[str, list[str]]],
+    *,
+    text: bool = True,
+) -> tuple[CliRunResult | None, str | None, str | None]:
+    """Try available CLI backends in order.
+
+    Returns ``(result, last_error, not_found_error)``. Exactly one of
+    ``result`` or ``not_found_error`` is set on success / missing-object.
+    ``last_error`` is the most recent non-missing backend failure.
+    """
+    last_err: str | None = None
+    for tool, cmd in candidates:
+        if shutil.which(tool) is None:
+            continue
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=text, check=False)
+        except OSError as e:
+            last_err = f"{tool} failed to start: {e}"
+            continue
+        stdout = proc.stdout or ("" if text else b"")
+        stderr = proc.stderr or ("" if text else b"")
+        if proc.returncode == 0:
+            return CliRunResult(tool=tool, stdout=stdout, stderr=stderr), None, None
+        if text:
+            combined = str(stderr) + str(stdout)
+        else:
+            combined = bytes(stderr).decode("utf-8", "replace") + bytes(stdout).decode(
+                "utf-8", "replace"
+            )
+        if _looks_not_found(combined):
+            return None, last_err, f"{tool}: {combined.strip()[:400]}"
+        last_err = f"{tool} rc={proc.returncode}: {combined.strip()[:400]}"
+    return None, last_err, None
+
+
 def _parse_cli_ls(stdout: str, tool: str) -> list[LsEntry]:
     """Parse ``s5cmd ls`` / ``aws s3 ls`` output into entries.
 
@@ -83,21 +129,17 @@ def ls_prefix(s3_prefix: str) -> list[LsEntry]:
     when every backend genuinely failed.
     """
     uri = s3_prefix.rstrip("/") + "/"
-    last_err: str | None = None
 
-    for tool, cmd in (
-        ("s5cmd", ["s5cmd", "ls", uri]),
-        ("aws", ["aws", "s3", "ls", uri]),
-    ):
-        if shutil.which(tool) is None:
-            continue
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode == 0:
-            return _parse_cli_ls(proc.stdout, tool)
-        combined = (proc.stderr or "") + (proc.stdout or "")
-        if _looks_not_found(combined):
-            return []
-        last_err = f"{tool} rc={proc.returncode}: {combined.strip()[:300]}"
+    result, last_err, not_found = run_cli_candidates(
+        (
+            ("s5cmd", ["s5cmd", "ls", uri]),
+            ("aws", ["aws", "s3", "ls", uri]),
+        )
+    )
+    if result is not None:
+        return _parse_cli_ls(str(result.stdout), result.tool)
+    if not_found is not None:
+        return []
 
     try:
         return _boto3_ls_prefix(uri)
@@ -154,22 +196,50 @@ def head_object(s3_uri: str) -> int | None:
 
 def ls_prefix_exact(s3_uri: str) -> list[LsEntry]:
     """``ls`` of an exact object URI (no trailing slash appended)."""
-    for tool, cmd in (
-        ("s5cmd", ["s5cmd", "ls", s3_uri]),
-        ("aws", ["aws", "s3", "ls", s3_uri]),
-    ):
-        if shutil.which(tool) is None:
-            continue
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode == 0:
-            return _parse_cli_ls(proc.stdout, tool)
-        combined = (proc.stderr or "") + (proc.stdout or "")
-        if _looks_not_found(combined):
-            return []
-        raise RuntimeError(
-            f"[arcstore] ls {s3_uri} failed: {combined.strip()[:300]}"
+    result, last_err, not_found = run_cli_candidates(
+        (
+            ("s5cmd", ["s5cmd", "ls", s3_uri]),
+            ("aws", ["aws", "s3", "ls", s3_uri]),
         )
+    )
+    if result is not None:
+        return _parse_cli_ls(str(result.stdout), result.tool)
+    if not_found is not None:
+        return []
+    if last_err is not None:
+        raise RuntimeError(f"[arcstore] ls {s3_uri} failed: {last_err}")
     return _boto3_ls_prefix(s3_uri)
+
+
+def read_object_bytes(s3_uri: str) -> bytes:
+    """Read an object straight into memory: s5cmd cat -> aws cp - -> boto3.
+
+    The CLI-first order matters: training images often ship ``s5cmd`` but
+    not ``boto3``, so a boto3-only read would spuriously fail there. Raises
+    ``FileNotFoundError`` for a missing object.
+    """
+    result, _last_err, not_found = run_cli_candidates(
+        (
+            ("s5cmd", ["s5cmd", "cat", s3_uri]),
+            ("aws", ["aws", "s3", "cp", s3_uri, "-"]),
+        ),
+        text=False,
+    )
+    if result is not None:
+        return bytes(result.stdout)
+    if not_found is not None:
+        raise FileNotFoundError(f"{s3_uri} ({not_found})")
+
+    import boto3
+    from botocore.exceptions import ClientError
+
+    bucket, key = split_s3(s3_uri)
+    try:
+        return boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code", "") in ("404", "NoSuchKey"):
+            raise FileNotFoundError(s3_uri) from e
+        raise
 
 
 def download_file(s3_uri: str, local_path: str, *, label: str = "arcstore") -> None:
@@ -180,29 +250,19 @@ def download_file(s3_uri: str, local_path: str, *, label: str = "arcstore") -> N
     """
     os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
 
-    candidates: list[list[str]] = []
+    candidates: list[tuple[str, list[str]]] = []
     if have_s5cmd():
-        candidates.append(["s5cmd", "cp", s3_uri, local_path])
+        candidates.append(("s5cmd", ["s5cmd", "cp", s3_uri, local_path]))
     if have_aws():
-        candidates.append(["aws", "s3", "cp", s3_uri, local_path])
+        candidates.append(("aws", ["aws", "s3", "cp", s3_uri, local_path]))
 
-    last_err: str | None = None
-    for cmd in candidates:
-        tool = cmd[0]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        except OSError as e:
-            last_err = f"{tool} failed to start: {e}"
-            continue
-        if proc.returncode == 0:
-            return
-        combined = (proc.stderr or "") + (proc.stdout or "")
-        if _looks_not_found(combined):
-            raise FileNotFoundError(
-                f"{label}: S3 object does not exist: {s3_uri!r} "
-                f"({tool}: {combined.strip()[:400]})"
-            )
-        last_err = f"{tool} rc={proc.returncode}: {combined.strip()[:400]}"
+    result, last_err, not_found = run_cli_candidates(candidates)
+    if result is not None:
+        return
+    if not_found is not None:
+        raise FileNotFoundError(
+            f"{label}: S3 object does not exist: {s3_uri!r} ({not_found})"
+        )
 
     try:
         import boto3
