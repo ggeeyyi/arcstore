@@ -16,23 +16,23 @@ def test_tar_url_local_joins(tmp_path):
     assert tar_url(str(tmp_path), "a.tar") == str(tmp_path / "a.tar")
 
 
-def test_tar_url_mounted_defaults_to_direct_s3(monkeypatch, tmp_path):
+def test_tar_url_mounted_used_by_default(monkeypatch, tmp_path):
     mnt = tmp_path / "mnt"
     (mnt / "shards").mkdir(parents=True)
     monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={mnt}")
     arcstore.refresh_mounts()
-    assert tar_url("s3://bkt/shards", "a.tar") == (
+    # Default (auto): a mounted bucket opens shards as mounted files.
+    assert tar_url("s3://bkt/shards", "a.tar") == str(mnt / "shards" / "a.tar")
+
+
+def test_tar_url_mounted_explicit_direct_s3(monkeypatch, tmp_path):
+    mnt = tmp_path / "mnt"
+    (mnt / "shards").mkdir(parents=True)
+    monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={mnt}")
+    arcstore.refresh_mounts()
+    # direct_s3 opts out of the mount even when it exists.
+    assert tar_url("s3://bkt/shards", "a.tar", read_policy="direct_s3") == (
         "pipe:s5cmd cat s3://bkt/shards/a.tar"
-    )
-
-
-def test_tar_url_mounted_explicit_mount_policy(monkeypatch, tmp_path):
-    mnt = tmp_path / "mnt"
-    (mnt / "shards").mkdir(parents=True)
-    monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={mnt}")
-    arcstore.refresh_mounts()
-    assert tar_url("s3://bkt/shards", "a.tar", read_policy="mount") == str(
-        mnt / "shards" / "a.tar"
     )
 
 

@@ -17,6 +17,17 @@ torch = [
     "runai-model-streamer-s3>=0.11",
     "webdataset>=0.2",
 ]
+# Optional training-stack integrations (merged from arc_toolkit). Each is opt-in
+# so the base + torch installs stay lean.
+accelerate = [
+    "accelerate>=0.30",
+]
+deepspeed = [
+    "deepspeed>=0.14",
+]
+mosaic = [
+    "mosaicml-streaming>=0.7",
+]
 test = [
     "pytest>=8",
     "moto[s3]>=5",
@@ -24,13 +35,21 @@ test = [
 
 [project.scripts]
 arcstore-tee = "arcstore.logtee:main"
+arcstore-sync = "arcstore.sync:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/arcstore"]
+only-include = ["src"]
+exclude = ["src/arcstore.py"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = "arcstore"
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/arcstore.py" = "arcstore/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -120,6 +120,22 @@ def test_ensure_local_file_download_and_hit(fake_s5cmd, caplog):
     assert any("cache hit" in r.message for r in caplog.records)
 
 
+def test_ensure_local_file_cache_keys_include_full_uri(fake_s5cmd):
+    first = fake_s5cmd / "bkt" / "a"
+    second = fake_s5cmd / "bkt" / "b"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "manifest.jsonl").write_text("first\n")
+    (second / "manifest.jsonl").write_text("other\n")  # same byte length
+
+    p1 = arcstore.ensure_local_file("s3://bkt/a/manifest.jsonl")
+    p2 = arcstore.ensure_local_file("s3://bkt/b/manifest.jsonl")
+
+    assert p1 != p2
+    assert open(p1).read() == "first\n"
+    assert open(p2).read() == "other\n"
+
+
 def test_ensure_local_file_mount_shortcircuit(monkeypatch, fake_s3_root, fake_s5cmd):
     base = fake_s3_root / "bkt" / "meta"
     base.mkdir(parents=True)

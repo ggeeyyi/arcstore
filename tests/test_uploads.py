@@ -62,6 +62,24 @@ def test_download_dir_requires_marker(fake_s5cmd, tmp_path):
         )
 
 
+def test_download_dir_incomplete_cli_wraps_boto3_failure(fake_s5cmd, tmp_path, monkeypatch):
+    src = fake_s5cmd / "bkt" / "dcp"
+    src.mkdir(parents=True)
+    (src / "shard.bin").write_bytes(b"x")
+    monkeypatch.setattr(
+        "arcstore.uploads._boto3_download_dir",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bad credentials")),
+    )
+
+    with pytest.raises(FileNotFoundError, match="complete local dir"):
+        arcstore.download_dir(
+            "s3://bkt/dcp",
+            str(tmp_path / "out"),
+            required_files=(".metadata",),
+            retries=1,
+        )
+
+
 def test_download_dir_marker_passes(fake_s5cmd, tmp_path):
     src = fake_s5cmd / "bkt" / "dcp"
     src.mkdir(parents=True)

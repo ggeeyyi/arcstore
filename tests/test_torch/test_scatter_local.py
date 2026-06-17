@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from arcstore.torch import ScatterPtDataset, reservoir_shuffle  # noqa: E402
+from arcstore.torch import ScatterPtDataset  # noqa: E402
 
 
 @pytest.fixture
@@ -38,17 +38,18 @@ def test_rank_sharding(pt_dir, monkeypatch):
     assert n0 == n1 == 4
 
 
-def test_mount_redirect_requires_policy(pt_dir, monkeypatch):
-    """Mounted buckets are explicit for training hot paths."""
+def test_mount_used_by_default(pt_dir, monkeypatch):
+    """A usable mount is read by default (ARCSTORE_DATA_READ_POLICY=auto)."""
     monkeypatch.setenv("ARCSTORE_S3_MOUNTS", f"bkt={pt_dir}")
     import arcstore
 
     arcstore.refresh_mounts()
     ds = ScatterPtDataset("s3://bkt", shuffle_buffer=1)
-    assert ds._local_dir is None
-    ds = ScatterPtDataset("s3://bkt", read_policy="mount", shuffle_buffer=1)
     assert ds._local_dir == str(pt_dir)
     assert len(list(ds)) == 8
+    # Explicit direct_s3 opts out of the mount.
+    ds_direct = ScatterPtDataset("s3://bkt", read_policy="direct_s3", shuffle_buffer=1)
+    assert ds_direct._local_dir is None
 
 
 def test_use_mount_false_forces_s3(pt_dir, monkeypatch):
@@ -65,8 +66,3 @@ def test_len_requires_length(pt_dir):
     with pytest.raises(TypeError):
         len(ds)
     assert len(ScatterPtDataset(str(pt_dir), length=8)) == 8
-
-
-def test_reservoir_shuffle_preserves_multiset():
-    out = list(reservoir_shuffle(iter(range(100)), buffer_size=10, seed=1))
-    assert sorted(out) == list(range(100))
