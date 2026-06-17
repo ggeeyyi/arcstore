@@ -92,45 +92,36 @@ arcstore.wait_for_uploads()                                          # 退出前
 # 读:本地 / mount / S3 一致语义
 data = arcstore.read_bytes("s3://bkt/run/metrics.json")
 
-# torch 扩展(需 [torch]):流式权重 / DCP 全量态 / scatter 数据集
-from arcstore.torch import load_safetensors_auto, save_full_state, load_full_state, ScatterPtDataset
+# torch 扩展(需 [torch]):DCP 全量态 / scatter 数据集等底层能力
+from arcstore.torch import save_full_state, load_full_state, ScatterPtDataset
 ```
 
-完整接口与分场景用法见下:[环境变量](#环境变量) · [五类需求速查](#五类需求速查) · [通用读原语](#通用读原语)。
+完整接口与分场景用法见下:[接口层级](#接口层级) · [五类需求速查](#五类需求速查) · [通用读写原语](#通用读写原语)。
 
-## 环境变量
+## 接口层级
 
-| 变量 | 默认 | 作用 |
-|---|---|---|
-| `ARCSTORE_S3_MOUNTS` | 未设 | mount 表:`bucket=/mountdir,bucket2=/dir2` |
-| `ARCSTORE_USE_MOUNTS` | `1` | mount 翻译总开关 |
-| `ARCSTORE_READ_POLICY` | `auto` | 通用读策略:`direct_s3`/`mount`/`auto` |
-| `ARCSTORE_DATA_READ_POLICY` | `auto` | scatter 数据集默认读策略(挂载存在则读挂载本地路径) |
-| `ARCSTORE_WDS_READ_POLICY` | `auto` | WebDataset 默认读策略(挂载存在则读挂载本地路径) |
-| `ARCSTORE_MODEL_READ_POLICY` | `direct_s3` | safetensors 默认读策略(挂载上 streamer 会死锁,故保持直连) |
-| `ARCSTORE_STREAMER_CONCURRENCY` | `32` | run:ai streamer 并发 |
-| `ARCSTORE_STREAMER_MEMORY_LIMIT` | `34359738368` | run:ai streamer 有界内存 |
-| `ARCSTORE_LOCAL_ROOT` | `/local-ssd/arcstore/workdirs` | `split_workdir` 的本地镜像根 |
-| `ARCSTORE_CACHE_DIR` | `/local-ssd/arcstore/cache`(无 `/local-ssd` 时回 `/tmp/arcstore-cache`) | `stage_to_local` 缓存根 |
-| `ARCSTORE_CACHE_ENABLE` | `1` | staging 开关 |
-| `ARCSTORE_CACHE_BUDGET_GIB` | `200` | 缓存 LRU 预算 |
-| `ARCSTORE_STAGE_PREFIXES` | 未设(=全部) | staging 白名单前缀(逗号分隔) |
-| `ARCSTORE_S5CMD_WORKERS` | `32` | s5cmd `--numworkers` |
-| `ARCSTORE_DCP_STAGE_DIR` | `/local-ssd/arcstore/dcp_load` | DCP S3 读取的节点级预取目录 |
-| `ARCSTORE_DCP_SAVE_STAGE_DIR` | `/local-ssd/arcstore/dcp_save`(无 `/local-ssd` 时回 `/tmp/arcstore/dcp_save`) | DCP S3 写入 fallback 的本地暂存目录 |
+ARCStore 的接口按抽象层级组织。实现功能时优先从高层接口查起;只有高层接口
+无法表达需要的控制粒度时,再向下使用底层能力。
 
-`AWS_REGION` / `AWS_DEFAULT_REGION` 照常生效(默认 `us-west-2`)。
+| 层级 | 定位 | 主要接口 | 适合场景 |
+|---|---|---|---|
+| L4 | 训练/运行编排层 | `CheckpointManager`、`RunStorage`、`LogTee`、`ContentsManager` | 完整训练流程、run 目录约定、日志写回、第三方库路径适配 |
+| L3 | 统一任务入口层 | `open_dataset`、`build_dataloader`、`save_checkpoint`、`load_checkpoint`、`put`、`open_read/open_write` | dataset、checkpoint、小文件/目录读写的推荐入口 |
+| L2 | 专用底层能力层 | `load_ckpt`、`save_full_state/load_full_state`、`load_safetensors_auto`、`ScatterPtDataset`、`build_wds_dataset` | 需要绕过统一分发、直接控制某个后端实现 |
+| L1 | 通用 IO 与本地化层 | `upload_file/upload_dir`、`download_file/download_dir`、`stage_to_local`、`ensure_local_file`、`split_workdir`、`list_prefix/glob_files` | 只关心文件/目录传输、本地缓存、S3 workdir 映射 |
+| L0 | 路径解析与基础设施 | `resolve`、`Location`、`is_s3`、`split_s3`、`refresh_mounts`、`s3cli.*`、`_env.*` | 调试路径分发、扩展底层传输、库内部基础设施 |
 
-典型 pod 配置:
+常用查询顺序:
 
-```bash
-# 配置 mount 表后,数据集(scatter/wds)默认就会读挂载的本地路径(如 /threed-code/...):
-export ARCSTORE_S3_MOUNTS="arcwm-code-us-west-2=/threed-code,arcwm-asset-us-west-2=/asset"
-# 如需让数据集也强制走直连 S3(忽略挂载):
-export ARCSTORE_DATA_READ_POLICY=direct_s3
-export ARCSTORE_WDS_READ_POLICY=direct_s3
-# 模型权重(safetensors)默认仍直连 S3(挂载上 run:ai streamer 会死锁)。
-```
+1. 训练中要自动保存、找最新、续训、清理旧 checkpoint:用 `CheckpointManager`。
+2. 一次性 checkpoint 读写:用 `save_checkpoint` / `load_checkpoint`,并显式传 `kind`。
+3. dataset 读取:先用 `build_dataloader`,需要自己组 loader 时用 `open_dataset`。
+4. 第三方库只接受本地路径:用 `ContentsManager`。
+5. 日志写回:用 `LogTee` 或 `arcstore-tee`。
+6. run 目录组织:用 `RunStorage`。
+7. 普通 bytes/file/dir 读写:用 `read_bytes`、`open_read`、`write_bytes`、`open_write`、`put`。
+8. 需要本地化或传输细节:用 `stage_to_local`、`ensure_local_file`、`upload_*`、`download_*`。
+9. 调试路径/mount/S3 分发:用 `resolve` / `Location`。
 
 ## 五类需求速查
 
@@ -304,7 +295,7 @@ tee = arcstore.LogTee("/local-ssd/run/logs/run.log", "s3://bkt/run/logs/run.log"
 tee.close()
 ```
 
-## 训练编排层(参考 arc_toolkit 合并)
+## 训练编排层
 
 以下为参考内部库 `arc_toolkit` 合并进 arcstore 的训练支撑能力,均位于
 `arcstore.torch.*`(需 `[torch]`),核心 IO 层不依赖 torch。
@@ -348,10 +339,16 @@ from arcstore.torch import EMA, PerfTracker, get_gpu_memory_stats
 ### 权重导出 / 加载
 
 ```python
-from arcstore.torch import save_safetensors_weights, load_pretrained
-save_safetensors_weights(model, "/local/out", s3_prefix="s3://bkt/models/run1")
-stats = load_pretrained(model, "s3://bkt/models/Wan2.2-TI2V-5B/")  # mount→mmap, 直连→streamer
+import arcstore
+
+# 推荐统一 checkpoint 接口:导出 / 读取 safetensors 权重
+arcstore.save_checkpoint("s3://bkt/models/run1/", "safetensors", model=model)
+state_dict = arcstore.load_checkpoint("s3://bkt/models/run1/", "safetensors")
+model.load_state_dict(state_dict, strict=False)
 ```
+
+`save_safetensors_weights` / `load_pretrained` 仍保留为底层/便利函数;README 主路径统一使用
+`save_checkpoint` / `load_checkpoint(kind="safetensors")`。
 
 ### ContentsManager —— “给我个本地路径,退出自动上传”
 
